@@ -1,0 +1,120 @@
+Good strategic question. Let me think through this precisely as an architect — what is the minimum viable sequence of changes that delivers real value at each step without breaking what is running today.
+Governing Principles
+Before the phases:
+Nothing in Option A changes until a domain is validated in UDM. The existing EAV pipeline, rules engine stored procedure, pivot MVs, and RDM DI reports all continue running unchanged throughout the migration. UDM runs alongside — not instead of — until each domain passes validation.
+Every phase delivers standalone value. If the programme pauses after any phase, what was built is still useful. Nothing is half-built infrastructure with no return until the next phase completes.
+Distribution is the cutover point — not the pipeline. The switchover for any domain happens once — when distribution queries udm_{domain}_arb instead of the existing pivot MV. Everything before that point is invisible to consumers.
+Phase 0 — Schema Foundation
+Risk: Zero. Reversible: Yes — drop the schema.
+What you do:
+Deploy Tier 1 DDL (v3) to DEV, then TEST, then PROD via the standard release pipeline. Empty tables. No engine. No data.
+What changes: A new UDM schema exists with 27 empty tables.
+What stays the same: Everything. No existing pipeline is touched.
+Value delivered: The schema is the contract. Every subsequent phase has a governed target to write to. The PO and architecture team can start populating the catalog manually immediately — no engine needed for that.
+Phase 1 — Catalog Population
+Risk: Very low — inserts only, no existing tables modified.
+What you do — four parallel workstreams:
+1a. Source system catalog
+Seed udm_source_system from DW.src_sys_dim. One INSERT per source system. Every subsequent registration has a governed vendor_id.
+1b. Reference data seeding
+Register DW.src_sys_dim, CST_DIM, DIM_NAICS, DIM_GEOGRAPHY, DIM_COUNTRY as REFERENCE_SOURCE. Run the engine in REFERENCE_SOURCE mode only — no fact processing. Populates udm_ref_company, udm_ref_sector, udm_ref_region, udm_ref_country, and creates udm_entity_registry rows as side effect. This is a read from RDM and write to UDM — zero impact on RDM.
+1c. Source registry population
+Register all existing Option A sources in udm_source_registry:
+Code
+This gives you the single platform inventory that does not exist today. Every source is now catalogued — even those not yet migrating.
+1d. Precedence rules extraction — highest-value quick win
+Extract the hardcoded vendor priority logic from the Option A rules engine stored procedure. INSERT those rules into udm_precedence_rules. Refactor the stored procedure to read from the table instead. Zero pipeline change — the procedure still runs on the same schedule producing the same output. But the rules are now:
+Visible to the PO without reading PL/SQL
+Auditable with effective dates
+Changeable via a change request INSERT/UPDATE — not a code deployment
+What changes: UDM catalog tables are populated. The Option A stored procedure reads from udm_precedence_rules instead of having rules hardcoded.
+What stays the same: All existing pipelines, schedules, and consumer queries.
+Value delivered:
+Single platform inventory for the first time
+Governed source system catalog
+Auditable, config-driven precedence rules
+Reference and entity data ready for engine use
+Phase 2 — Detection Layer
+Risk: Very low — reads schema dictionary and EAV data, writes only to dsc_ tables.*
+What you do:
+Deploy Tier 2 DDL (dsc_* tables). Run the structural detection procedure against RDM and STAGE schemas. Run EAV value detection against the Federated EAV table. Surface findings to PO via the review queue.
+What changes: Detection processes run on schedule. PO reviews queue. Approved findings generate catalog entries in udm_attribute_map.
+What stays the same: All existing pipelines unchanged.
+Value delivered:
+First time the platform knows what it has versus what is catalogued
+Column drops and new attribute arrivals are detected rather than discovered reactively
+udm_attribute_map begins to be populated — the DI specification exists
+Phase 3 — Manifest and Lineage Instrumentation
+Risk: Very low — additive only.
+What you do:
+Instrument the existing ETL jobs to write a manifest entry on each file arrival and a lineage row on each load completion. No existing logic changes — just two additional INSERTs per load execution. This can be done as a wrapper around existing jobs or as a post-load trigger.
+What changes: udm_delivery_manifest and udm_lineage start accumulating data.
+What stays the same: All existing pipeline logic unchanged. Distribution unchanged.
+Value delivered:
+First time you have a governed audit trail of every load
+Delivery completeness tracking — partial bundles are now visible
+Lineage is populated before the engine runs — historical context for the first domain migration
+Phase 4 — First Domain Parallel Run
+Risk: Medium — new engine runs alongside existing, but distribution unchanged.
+This is the first real engine work. Choose the domain with the most pain in Option A — typically the one with the most EAV attributes, the highest pivot cost, or the most frequent consumer complaints about stale data.
+What you do:
+Build the harmonisation engine (Module 6) for one domain only. Create udm_{domain}_stk and udm_{domain}_arb. Run the engine on the same schedule as the existing Option A pipeline — after each vendor load completes. Both pipelines produce output independently.
+Run the validation suite — compare udm_{domain}_arb against the existing Option A pivot MV row by row. Document every discrepancy. Resolve each one. This is not a bug — it is the validation gate.
+The validation gate has three conditions before Phase 5 begins:
+Code
+What changes: The harmonisation engine runs. udm_{domain}_stk and udm_{domain}_arb are populated alongside the existing EAV tables.
+What stays the same: Distribution still reads from the Option A pivot MV. Consumers are unaffected.
+Value delivered:
+Full UDM pipeline running for one domain
+Attribute-level DI for the first time
+Validation evidence for the distribution switchover decision
+Phase 5 — Distribution Switchover (One Domain)
+Risk: Medium — consumer-facing change. Managed via view swap.
+What you do:
+The consumer-facing surface for this domain is currently a pivot MV. The switchover is implemented as a view rename or synonym swap — not a consumer SQL change.
+Sql
+The synonym swap is the cutover. It is atomic and reversible — swap back in under a minute if anything is wrong.
+After cutover:
+udm_source_registry governance_status for Option A EAV sources → MIGRATING then RETIRED
+Option A EAV pipeline for this domain is stopped
+RDM DI reports for this domain are retired
+EAV tables for this domain become read-only (retained for historical queries, archived on schedule)
+What changes: Distribution queries UDM arb table for this domain. Option A EAV pipeline stops.
+What stays the same: Consumer SQL unchanged. All other domains unchanged.
+Value delivered:
+First domain fully on UDM — real production value
+EAV pipeline cost eliminated for this domain
+Full attribute-level DI in production
+Precedent and confidence for subsequent domains
+Phase 6 — Organic Domain-by-Domain Migration
+Risk: Decreasing with each domain — engine is proven, process is established.
+Repeat Phases 4 and 5 for each remaining domain. Each domain is independent. The engine is generic — adding a domain is catalog entries, not code changes.
+Prioritisation sequence — domains in this order:
+Code
+New domains arriving during the programme bypass Option A entirely — registered directly as UDM_CATALOGED and go straight to Phase 4.
+Phase 7 — RDM Path Retirement
+Risk: Low by this point — all domains migrated, validation evidence accumulated.
+Once all domains have passed Phase 5:
+The Option A EAV tables are archived
+The RDM DI report infrastructure is retired
+CST_DIM and other dimensions that were identity sources become read-only references
+The RDM pipeline is reduced to serving the operational applications that have a direct dependency on it — everything else flows through UDM
+Migration Sequence Summary
+Code
+Where This Differs From a Typical Migration
+Typical migration
+This approach
+Build everything, then cut over
+Build incrementally — each phase has value
+Consumer SQL changes at cutover
+View synonym swap — zero consumer change
+Risk concentrated at go-live
+Risk distributed across domain switchovers
+New system replaces old
+New system runs alongside until validated
+Schema change = pipeline change
+Schema deployed independently — catalog populated separately
+The Minimum Viable Sequence
+If the programme can only deliver two phases before a review:
+Phase 0 + Phase 1 give you the single platform inventory, governed source system catalog, config-driven precedence rules, and reference/entity data seeded — all without touching a single existing pipeline. That is a meaningful deliverable that justifies the architecture regardless of whether full migration ever completes.
+Shall I produce a formal migration plan document, or move directly to the detection layer DDL?
