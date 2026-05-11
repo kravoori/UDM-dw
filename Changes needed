@@ -1,0 +1,78 @@
+Context:
+We operate a 5-layer data platform:
+
+  Stage
+    → RDM           (dimensional model, vendor data in relational tables)
+    → Federated     (EAV, source data stored as-is in key-value rows)
+    → Standardized  (EAV, same key-value structure but with unit conversion
+                     and attribute name normalisation applied)
+    → UDM           (golden source, target of the new architecture)
+
+We are transitioning to a new UDM architecture gradually, source by source.
+The UDM engine is catalog-driven: source_registry defines where to read from,
+attribute_map defines canonical names and transform rules (including unit
+conversion), and currency_mechanism handles current-row filtering. The engine
+generates a single INSERT...SELECT per source at runtime — transforms are
+SQL expressions embedded in the SELECT list, not a downstream ETL layer.
+
+Two questions for the gradual transition:
+
+Question 1 — Layer elimination:
+Given that the UDM engine already performs attribute name standardization
+(via canonical_name), unit conversion (via unit_from/unit_to and transform_rule),
+and currency filtering (via currency_mechanism), the Standardized layer is
+functionally redundant once UDM is in place. For sources being migrated to UDM:
+
+  a) Should the engine read from Federated (EAV, source as-is) and absorb
+     the standardization work into the catalog, eliminating the Standardized
+     materialisation entirely for migrated sources?
+
+  b) Should the engine read from RDM (dimensional) directly, eliminating both
+     Federated and Standardized for migrated sources — accepting that each
+     vendor's RDM table must be registered separately in source_registry?
+
+  c) Should Standardized be retained as the UDM read layer during the
+     transition window, then decommissioned once all sources have migrated?
+
+The constraint is that existing RDM and Standardized consumers (reports,
+downstream systems) cannot be cut over simultaneously. Proposed changes
+must not break those consumers during the transition window.
+
+What criteria — source stability, consumer count, attribute volume, team
+ownership — should govern which option applies to each source?
+
+Question 2 — EAV at 250+ attributes:
+The Federated and Standardized layers store data in EAV format. Some subject
+areas have 250+ distinct attribute codes per entity. If the UDM engine reads
+from an EAV layer, it generates a pivot query using conditional aggregation:
+
+  SELECT
+    MAX(CASE WHEN attr_code = 'X001' THEN TO_NUMBER(attr_val) END),
+    MAX(CASE WHEN attr_code = 'X002' THEN TO_NUMBER(attr_val) END),
+    -- × 250 or more
+  FROM eav_table
+  GROUP BY entity_key
+
+At 250 attributes this produces a 20KB+ SQL string with significant CBO parse
+overhead, 250 CASE evaluations per EAV row regardless of attribute sparsity,
+and a 250-column stack table that is difficult to partition and index selectively.
+
+What is the recommended approach for high-attribute-count subject areas:
+
+  a) Domain decomposition — split into narrower subject areas (e.g. financial
+     metrics, operational metrics, ESG metrics), each with its own stack table
+     of 50-80 columns, aligned to governance ownership boundaries?
+
+  b) Pre-pivot staging — land EAV into a wide columnar temp table using
+     Oracle native PIVOT before the engine reads it, registering the pivoted
+     table as a COLUMNAR source in source_registry?
+
+  c) Retain EAV in UDM stack tables natively, with canonical_name and
+     entity_key as the grain, accepting that downstream consumers must
+     pivot on read?
+
+  d) A threshold-based hybrid — columnar below N attributes, EAV-native
+     above, with the threshold determined by row volume and sparsity rate?
+
+At what attribute count, row volume, and sparsity rate does each approach
+become preferable on Oracle 19c?
