@@ -1,0 +1,41 @@
+Using the architecture change report and the DDL and package definitions 
+you have already generated, produce a formal specification document that 
+conforms to our naming standards.
+
+To do this:
+
+1. **Read the Class Name File** (provided below) — this is the authoritative 
+   source for:
+   - Approved abbreviations for full words/terms
+   - Table naming conventions and structure
+   - Any prefix/suffix rules defined in the standard
+
+2. **Apply the naming standard to all DDL objects**, including:
+   - Table names
+   - Column names
+   - Indexes, constraints, and sequences
+   - Package names and any internal procedure/function names
+
+3. **Where a full name appears in the current DDL**, look it up in the 
+   class name file and replace it with the approved abbreviation. 
+   If a term has no entry in the class name file, flag it explicitly 
+   as **[NO STANDARD FOUND - needs classification]** so it can be reviewed.
+
+4. **Output the following as the spec:**
+   - Updated DDL with compliant naming applied
+   - Updated package definition with compliant naming applied
+   - A mapping table showing: Original Name → Standard Name → Abbreviation 
+     Source (from class name file)
+   - A flagged list of any terms with no existing standard
+
+Do not change the logic or structure of the DDL or package — 
+only rename to conform to standards.
+
+--- CLASS NAME FILE ---
+[Paste your class name / abbreviation file here]
+
+--- EXISTING DDL ---
+[Paste DDL here]
+
+--- EXISTING PACKAGE ---
+[Paste package here]
