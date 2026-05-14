@@ -1,0 +1,65 @@
+Good — and this is the key insight that makes the UDM design elegant. You do not need to build column-level lineage separately. You already have it. Let me explain.
+The Insight — udm_attribute_map IS Column-Level Lineage
+Column-level lineage answers: where did this column value come from and what happened to it on the way?
+udm_attribute_map already contains exactly this information by design:
+Code
+The attribute map was designed as the DI specification. But read from the opposite direction, it is also a complete column-level data lineage graph. Nothing extra needs to be built — just queried correctly.
+The Three Lineage Questions an Auditor Asks
+Question 1 — Forward: where does source column X end up?
+Code
+Sql
+Result:
+Code
+Question 2 — Backward: where did canonical column Y come from?
+Code
+Sql
+Result — shows ALL sources that feed this canonical column:
+Code
+Three sources. Three different raw column names. Three different transformations. All feeding the same canonical column. This is the complete column lineage — visible in one query, no additional table required.
+Question 3 — Value-specific: for this specific value in the arb table, which source row produced it?
+This requires combining column-level lineage with row-level lineage:
+Sql
+Result — one row, complete audit trail:
+Code
+Everything an auditor needs in one query. No lineage table beyond what we already have.
+The Coalesce Case — Multiple Source Columns to One Canonical Column
+This is worth calling out specifically. When transform_rule = coalesce:scope1_direct,scope1_estimated, two source columns contribute to one canonical column. The attribute map has three rows:
+Code
+The backward lineage query returns all three rows for scope1_mtco2. To know which one was actually used for a specific entity in a specific period, read scope1_source_flag from the stack table:
+Sql
+The scope1_source_flag column — written by the flag: transform at harmonisation time — is the row-level column lineage indicator for coalesced attributes.
+What to Add — The Lineage View
+Rather than asking auditors to write these joins every time, surface it as a governed view:
+Sql
+Auditor queries become simple:
+Sql
+The Complete Lineage Picture
+Three layers, all queryable without additional tables:
+Code
+Summary
+Lineage Type
+Where It Lives
+New Table Needed
+Column → canonical mapping
+udm_attribute_map + source_registry
+No — view only
+Transform applied
+udm_attribute_map.transform_rule
+No
+Unit conversion
+udm_attribute_map.unit_from/to
+No
+Which source column was used (coalesce)
+stk.{metric}_source_flag
+No — flag column on stack
+When the batch ran
+udm_lineage
+No — already designed
+File arrival
+udm_delivery_manifest
+No — already designed
+Full audit trail per value
+Join of above 3 layers
+No — view or ad hoc join
+The entire column-level lineage requirement is satisfied by the attribute map as designed. The only deliverable is the udm_column_lineage view — one CREATE VIEW statement. That goes in WP-G1 alongside the lineage instrumentation.
+Shall I now move to the detection layer DDL?
