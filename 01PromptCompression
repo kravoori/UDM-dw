@@ -1,0 +1,29 @@
+You are an expert prompt engineer specializing in token optimization and cost reduction for LLMs. 
+
+Analyze the attached 700-line metric classification instructions file. Your task is to perform a strict, LOSSLESS compression of this file to minimize token usage for GitHub Copilot usage-based billing.
+
+Please apply the following optimization rules:
+1. Eliminate all conversational filler, introductory remarks, meta-commentary, and polite phrasing.
+2. Convert long prose descriptions of domain hierarchies, groups, classes, and rules into dense, highly structured Markdown formats (e.g., nested bulleted lists or compact tables).
+3. Consolidate overlapping or redundant rules. If a rule is repeated or implied elsewhere, merge it.
+4. Keep only the absolute minimum number of "few-shot" examples necessary to establish the pattern. If there are multiple examples demonstrating the same rule, keep only the most complex one and delete the rest.
+5. Use short, crisp variable names or shorthand where obvious (e.g., "Output: MD Table [Primary, Secondary, Group]").
+
+CRITICAL: The underlying classification logic, mapping rules, and output schemas must remain 100% accurate and functionally identical to the original file. Do not drop any domains, classes, or mapping criteria.
+
+Provide only the optimized markdown content.
+​[META-RULE: If a user asks to amend or add a rule to this document, integrate the new logic using the existing dense, non-prose, nested markdown format. Do not add conversational text, filler, or redundant examples.]
+
+
+I have a CSV file containing 700 classification rules mapping metric descriptions to domain hierarchies. 
+
+I want to build a local Python script that classifies new, messy source dictionary descriptions using semantic similarity (Vector Embeddings) instead of sending prompts to a Chat LLM.
+
+Please write a Python script using the `sentence-transformers` library (e.g., using the 'all-MiniLM-L6-v2' model) that does the following:
+1. Loads the rules CSV file.
+2. Pre-computes and caches the embeddings for all the rule descriptions.
+3. Takes a new batch of messy source metric descriptions as input.
+4. Computes the embedding for the new metrics and calculates the cosine similarity against the rules dataset.
+5. Returns the best-matching domain hierarchy classification if the similarity score is above a certain threshold (e.g., 0.75). If it's below that threshold, flag it as "Review Required."
+
+Provide clean, modular code with instructions on how to run it locally.
