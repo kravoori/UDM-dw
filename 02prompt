@@ -26,3 +26,23 @@ Please write a modular, clean, and well-documented Python script using `sentence
    - Return a cleanly structured pandas DataFrame or markdown table containing: Original Description, Best Match Description, Similarity Score, and the mapped Domain Hierarchy columns.
 
 Include explicit instructions on required libraries (pip install) and how to configure the confidence threshold.
+[CRITICAL CONFIGURATION: NO HUGGING FACE. NO TRANSFOMERS. NO EXTERNAL MODEL DOWNLOADS.]
+
+Write a standalone Python script from scratch using only standard data science libraries (`pandas` and `scikit-learn`). 
+
+Using ONLY these two specific reference files, build a text classification pipeline:
+1. Reference Rules: #Your_Compressed_Prompt_File
+2. Reference History: #Your_Historical_Classifications_File
+
+Please implement the following logic:
+1. Load the historical classifications dataset. 
+2. Combine the historical metrics' long descriptions with the rules definitions to create a master training text corpus.
+3. Initialize a `TfidfVectorizer` from `sklearn.feature_extraction.text` (configured with stop_words='english' and ngram_range=(1, 2) to catch multi-word phrases).
+4. Fit and transform the historical corpus into a TF-IDF matrix.
+5. Accept a new batch of incoming messy metric descriptions, and transform them using the same vectorizer.
+6. Use `cosine_similarity` from `sklearn.metrics.pairwise` to calculate the match scores between the new metrics and the historical baseline matrix.
+7. For each new metric, find the highest scoring match. 
+   - If the similarity score is >= 0.40 (Note: TF-IDF scores scale differently than embeddings, so 0.40-0.50 is a solid matching baseline), automatically output the target Domain, Class, and Canonical Name.
+   - If below the threshold, flag as "CONFIDENCE_LOW_REVIEW_REQUIRED".
+
+Provide clean, modular code that runs completely offline with zero model dependencies.
