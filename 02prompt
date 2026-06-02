@@ -1,0 +1,28 @@
+You are an expert Senior Data Engineer and Python developer. I want to build a local, highly efficient Python script that automates metric classification using Semantic Search (Vector Embeddings) to replace a costly LLM chat workflow.
+
+I have provided two context files:
+1. [#Your_Compressed_Prompt_File] — Contains the domain hierarchies, structural classification rules, and definition logic.
+2. [#Your_Historical_Classifications_File] — Contains the master list of all historical metrics mapped to their correct domains, classes, and groups based on their long dictionary descriptions.
+
+Please write a modular, clean, and well-documented Python script using `sentence-transformers` (utilizing the 'all-MiniLM-L6-v2' model) that executes the following pipeline:
+
+1. KNOWLEDGE BASE INITIALIZATION:
+   - Load the historical classifications data.
+   - Combine the historical "long descriptions" with the structural definition rules from the prompt file to form a comprehensive semantic text string for each target classification.
+   - Compute vector embeddings for this baseline knowledge base using SentenceTransformer.
+   - Cache/serialize these embeddings locally (e.g., using pickle or numpy) so they don't have to be re-calculated every time the script runs.
+
+2. BATCH CLASSIFICATION PIPELINE:
+   - Accept a new batch/list of incoming, messy source dictionary descriptions.
+   - Compute vector embeddings for these new incoming metrics.
+   - Calculate the Cosine Similarity matrix between the new metrics and the cached knowledge base.
+
+3. DETERMINISTIC THRESHOLD LOGIC:
+   - Identify the highest similarity match for each metric.
+   - If the similarity score is >= 0.80 (configurable parameter), automatically assign the corresponding Domain, Primary/Secondary Domain, Metric Group, Class, and Canonical Name.
+   - If the similarity score is < 0.80, flag the metric as "CONFIDENCE_LOW_REVIEW_REQUIRED" so I can manually pass only these edge cases to Copilot.
+
+4. OUTPUT:
+   - Return a cleanly structured pandas DataFrame or markdown table containing: Original Description, Best Match Description, Similarity Score, and the mapped Domain Hierarchy columns.
+
+Include explicit instructions on required libraries (pip install) and how to configure the confidence threshold.
