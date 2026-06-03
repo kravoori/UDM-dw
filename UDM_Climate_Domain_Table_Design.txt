@@ -1,0 +1,636 @@
+================================================================================
+UDM CLIMATE DOMAIN — TABLE DESIGN AND TIME DIMENSION STRATEGY
+Version : 1.0  |  Status : Decided
+================================================================================
+
+This document captures the agreed table design for three climate datasets,
+the time dimension strategy per dataset, and the universal bi-temporal query
+pattern. It is a standalone reference — readable without any prior context.
+
+
+================================================================================
+SECTION 1 — THE THREE DATASETS
+================================================================================
+
+DATASET 1 — GHG EMISSIONS
+  What it is   : Measured greenhouse gas emissions for a disclosure year.
+  Sources      : MSCI, S&P, and other ESG data vendors.
+  Subject to   : Restatement. A vendor may revise 2022 emissions in 2024.
+  Time concept : The year the emissions occurred — the disclosure year.
+  Vendor names : FiscalYear / ReportingYear / DisclosureYear / CoverageYear.
+  All vendor names map to one canonical column: DSCLSR_YR_NO.
+
+DATASET 2 — CLIMATE TRANSITION
+  What it is   : Climate strategy, intensity metrics, assurance status,
+                 and disclosed targets for a disclosure period.
+  Sources      : Same as Dataset 1. Not always the same vendors.
+  Subject to   : Restatement. Same pattern as emissions.
+  Time concept : Same as Dataset 1 — the disclosure year.
+  Separate from Dataset 1 because source coverage differs (not all vendors
+  providing emissions also provide strategy and assurance data) and data item
+  ownership may differ across teams.
+
+DATASET 3A — RATINGS
+  What it is   : ESG rating, climate score, calculated on a specific date.
+  Sources      : MSCI ESG, S&P ESG, ISS, and other rating providers.
+  Subject to   : Not restated. A new rating replaces the prior rating.
+  Time concept : The date the rating was calculated or published.
+  Vendor names : RatingDate / CalculationDate / PublicationDate / AsOfDate.
+  All vendor names map to one canonical column: CALC_DT.
+
+DATASET 3B — COMMITMENTS
+  What it is   : Net-zero pledges, SBT commitments, Paris-alignment status,
+                 RE100, EP100, and other forward-looking commitments.
+  Sources      : MSCI, CDP, SBTi, proprietary research.
+  Subject to   : Revision and withdrawal. Events are infrequent.
+  Time concept : The date the commitment became effective — not a period,
+                 not a rating date. An event-driven effective date.
+  Vendor names : CommitmentDate / PledgeDate / AnnouncementDate / EffectiveDate.
+  All vendor names map to one canonical column: COMMIT_EFFT_DT.
+
+
+================================================================================
+SECTION 2 — ON HAVING NO TIME DIMENSION REFERENCE TABLE
+================================================================================
+
+The system does not have a udm_ref_time reference table at this stage.
+
+All time key columns (DSCLSR_YR_NO, CALC_DT, COMMIT_EFFT_DT) are raw typed
+columns on the stack table — not foreign keys to any reference table.
+
+This is intentional and does not compromise the design. The bi-temporal
+query pattern operates entirely on the src_bgn_tran_dt and src_end_tran_dt
+columns on each stack table. No reference table join is needed for
+point-in-time queries.
+
+If a time reference table is introduced later, the time key column values
+on existing stack tables do not change. The reference table join becomes
+additive to consumer queries — not structural to the table.
+
+Vendor terminology differences (FiscalYear vs ReportingYear vs DisclosureYear)
+are handled entirely in the source mapping layer via udm_data_item_src_map.
+They do not affect the table structure.
+
+
+================================================================================
+SECTION 3 — TYPE 1 VS TYPE 2 DECISION
+================================================================================
+
+ALL FOUR TABLES USE BI-TEMPORAL TYPE 2.
+
+  udm_ghg_emiss_fct   TYPE 2   Vendors restate historical emissions.
+                                Must answer: what did we know about 2022
+                                emissions as of 2023 before the 2024
+                                restatement arrived?
+
+  udm_clmt_tran_fct   TYPE 2   Same reason as emissions. Strategy disclosures
+                                and intensity metrics are restated.
+
+  udm_clmt_rtng_fct   TYPE 2   Not restated but history of ratings over time
+                                is required. Must answer: what was the MSCI
+                                ESG rating for this entity in Q1 2023?
+
+  udm_clmt_commit_fct TYPE 2   Commitment events are infrequent but regulatory
+                                audit requires: what commitment did this entity
+                                hold when a lending or investment decision was
+                                made in 2022?
+
+TYPE 1 IS REJECTED FOR ALL FOUR TABLES.
+  Reason: Type 1 overwrites prior values, destroying the ability to
+  reconstruct past states. This breaks point-in-time reporting, audit
+  trails, and regulatory queries. The ETL complexity concern for Type 2
+  is addressed by the ROW_CHK_SUM_TX change-detection mechanism:
+  when nothing changes on re-delivery, no new version is written.
+
+
+================================================================================
+SECTION 4 — THE BI-TEMPORAL COLUMN SET
+================================================================================
+
+All four tables carry an identical set of temporal columns. These columns
+are in addition to the table-specific natural key and metric columns.
+
+  ── SOURCE TRANSACTION TIME ─────────────────────────────────────────────────
+
+  src_bgn_tran_dt   DATE   NOT NULL
+    When this value was effective IN THE SOURCE.
+    NEVER changes after INSERT — it reflects what the source declared.
+
+    For DSCLSR_YR_NO tables (emissions, transition):
+      The date the vendor first delivered this value for this year.
+
+    For CALC_DT table (ratings):
+      Equal to CALC_DT. The rating was effective from its calculation date.
+
+    For COMMIT_EFFT_DT table (commitments):
+      Equal to COMMIT_EFFT_DT. The commitment was effective from this date.
+
+  src_end_tran_dt   DATE   NOT NULL
+    When this value was superseded IN THE SOURCE.
+    NEVER changes after INSERT.
+    9999-12-31 means still current in the source.
+
+    For DSCLSR_YR_NO tables:
+      Set when vendor delivers a restatement for the same year.
+
+    For CALC_DT table (ratings):
+      Set using LEAD() on ordered ratings per entity per rating type.
+      src_end_tran_dt of row N = CALC_DT of row N+1 minus 1 day.
+      9999-12-31 for the most recent rating.
+
+    For COMMIT_EFFT_DT table (commitments):
+      Set when commitment is revised, withdrawn, or superseded.
+      9999-12-31 while commitment remains active.
+
+  ── UDM TRANSACTION TIME ────────────────────────────────────────────────────
+
+  bgn_tran_dt       DATE   NOT NULL
+    SYSDATE at INSERT into UDM.
+    When UDM first held this version.
+    NEVER changes after INSERT.
+
+  end_tran_dt       DATE   NOT NULL   DEFAULT DATE '9999-12-31'
+    9999-12-31 when inserted (open — currently the active UDM version).
+    Updated to SYSDATE - 1 second when a re-delivery supersedes this row.
+
+  cur_fl            NUMBER(1)   NOT NULL   DEFAULT 1
+    1 = currently active version in UDM.
+    0 = superseded by a later delivery or correction.
+    Updated atomically with end_tran_dt.
+
+  ── Load audit ──────────────────────────────────────────────────────────────
+
+  load_dt           DATE   NOT NULL
+    SYSDATE at physical INSERT. Always the physical clock time.
+    Separate from bgn_tran_dt which may differ in correction scenarios.
+
+  migration_fl      CHAR(1)   NOT NULL
+    Y = loaded during historical migration from source.
+    N = loaded via live vendor delivery.
+
+  data_version      NUMBER(5)   NOT NULL
+    1 on first load for this natural key.
+    Increments on each re-delivery that produces a changed row.
+
+  row_chk_sum_tx    VARCHAR2(1024)
+    SHA256 hash of all metric columns.
+    On re-delivery: if hash unchanged, no new version is written.
+    This is the primary mechanism preventing version proliferation
+    when vendors re-send unchanged data.
+
+
+================================================================================
+SECTION 5 — TABLE DESIGNS
+================================================================================
+
+────────────────────────────────────────────────────────────────────────────────
+TABLE 1: udm_ghg_emiss_fct — GHG EMISSIONS
+────────────────────────────────────────────────────────────────────────────────
+
+  Purpose    : GHG emissions for a disclosure year per entity per source.
+  Grain      : COMPANY × DISCLOSURE_YEAR × SOURCE
+  Time key   : DSCLSR_YR_NO  NUMBER(4)  e.g. 2022, 2023, 2024
+
+  Natural key columns:
+    ENTITY_KY          VARCHAR2(20)   Resolved from vendor external ID via xref
+    DSCLSR_YR_NO       NUMBER(4)      Disclosure year
+    SRC_SYS_SHRT_NM    VARCHAR2(50)   Source system short name
+
+  Bi-temporal columns: (as defined in Section 4)
+    SRC_BGN_TRAN_DT, SRC_END_TRAN_DT, BGN_TRAN_DT, END_TRAN_DT, CUR_FL
+    LOAD_DT, MIGRATION_FL, DATA_VERSION, ROW_CHK_SUM_TX
+
+  Metric columns (examples — extended at domain onboarding):
+
+    Scope 1:
+    GHG_SC1_DIR_NO        NUMBER    Scope 1 direct — constituent column (Pass 1)
+    GHG_SC1_EST_NO        NUMBER    Scope 1 estimated — constituent (Pass 1)
+    GHG_SC1_MTCO2_NO      NUMBER    Scope 1 canonical — derived (Pass 2)
+    GHG_SC1_SRC_FL        VARCHAR2  DIRECT|ESTIMATED — source flag
+
+    Scope 2:
+    GHG_SC2_MKT_NO        NUMBER    Scope 2 market-based
+    GHG_SC2_LOC_NO        NUMBER    Scope 2 location-based
+    GHG_SC2_MTCO2_NO      NUMBER    Scope 2 canonical — derived (Pass 2)
+    GHG_SC2_MTH_CD        VARCHAR2  MARKET|LOCATION|UNKNOWN
+
+    Scope 3:
+    GHG_SC3_TTL_NO        NUMBER    Scope 3 total
+    GHG_SC3_UPSTR_NO      NUMBER    Scope 3 upstream
+    GHG_SC3_DNSTR_NO      NUMBER    Scope 3 downstream
+
+    Reporting metadata:
+    GHG_RPT_STD_CD        VARCHAR2  GHG Protocol / ISO 14064 / TCFD
+    GHG_ASRNC_LVL_CD      VARCHAR2  NONE|LIMITED|REASONABLE
+    GHG_BASE_YR_NO        NUMBER    Base year for intensity calculations
+    GHG_INTNSTY_NO        NUMBER    Emissions intensity
+    GHG_INTNSTY_DENOM_CD  VARCHAR2  USD_REV|FTE|TONNE_PROD
+
+  Primary key: (ENTITY_KY, DSCLSR_YR_NO, SRC_SYS_SHRT_NM,
+                SRC_BGN_TRAN_DT, BGN_TRAN_DT)
+
+  Mandatory indexes:
+    (ENTITY_KY, DSCLSR_YR_NO, SRC_SYS_SHRT_NM, CUR_FL)  COMPRESS 2
+    (ENTITY_KY, DSCLSR_YR_NO, SRC_BGN_TRAN_DT, SRC_END_TRAN_DT)
+    (ENTITY_KY, DSCLSR_YR_NO, BGN_TRAN_DT, END_TRAN_DT)
+
+
+────────────────────────────────────────────────────────────────────────────────
+TABLE 2: udm_clmt_tran_fct — CLIMATE TRANSITION
+────────────────────────────────────────────────────────────────────────────────
+
+  Purpose    : Climate strategy, intensity metrics, assurance, disclosed
+               targets for a disclosure period.
+  Grain      : COMPANY × DISCLOSURE_YEAR × SOURCE
+  Time key   : DSCLSR_YR_NO  NUMBER(4)  — same as emissions table
+
+  Why separate from udm_ghg_emiss_fct:
+    Not all vendors providing emissions also provide strategy and assurance.
+    Columns are sparse — many entities have emissions but no strategy disclosure.
+    Data item ownership may differ across business teams.
+
+  Natural key columns:
+    ENTITY_KY          VARCHAR2(20)
+    DSCLSR_YR_NO       NUMBER(4)
+    SRC_SYS_SHRT_NM    VARCHAR2(50)
+
+  Bi-temporal columns: (as Section 4)
+
+  Metric columns (examples):
+
+    Climate strategy:
+    CLMT_STRAT_FL          VARCHAR2  Y|N|PARTIAL
+    CLMT_STRAT_ALG_CD      VARCHAR2  PARIS_1_5|PARIS_2|NDC|NONE|NOT_DISCLOSED
+    CLMT_TRAN_PLN_FL       VARCHAR2  Y|N|IN_PROGRESS
+    CLMT_SCNRO_ANLYS_FL    VARCHAR2  Y|N|PARTIAL
+
+    Disclosed targets (for this disclosure year):
+    CLMT_SC1_TGT_PCT_NO    NUMBER    Scope 1 reduction target percentage
+    CLMT_SC1_TGT_YR_NO     NUMBER    Target year for Scope 1 reduction
+    CLMT_SC2_TGT_PCT_NO    NUMBER    Scope 2 reduction target percentage
+    CLMT_SC2_TGT_YR_NO     NUMBER    Target year for Scope 2 reduction
+    CLMT_NZ_TGT_YR_NO      NUMBER    Net-zero target year as disclosed
+
+    NOTE: These are disclosed targets as reported in this disclosure year.
+    They are DISTINCT from Dataset 3B (commitments) which tracks the
+    commitment event itself as an effective-dated record.
+    A disclosed target in the strategy table may lag the commitment event
+    in the commitment table by one disclosure year.
+
+    Intensity metrics:
+    CLMT_REV_INTNSTY_NO    NUMBER    tCO2 per $M revenue
+    CLMT_EMP_INTNSTY_NO    NUMBER    tCO2 per FTE
+    CLMT_PROD_INTNSTY_NO   NUMBER    Production-based intensity
+
+    Assurance:
+    CLMT_ASRNC_FL          VARCHAR2  Y|N|PARTIAL
+    CLMT_ASRNC_LVL_CD      VARCHAR2  LIMITED|REASONABLE
+    CLMT_ASRNC_STD_CD      VARCHAR2  ISAE3000|AA1000|OTHER
+
+  Primary key: (ENTITY_KY, DSCLSR_YR_NO, SRC_SYS_SHRT_NM,
+                SRC_BGN_TRAN_DT, BGN_TRAN_DT)
+
+  Mandatory indexes: same pattern as udm_ghg_emiss_fct
+
+
+────────────────────────────────────────────────────────────────────────────────
+TABLE 3A: udm_clmt_rtng_fct — RATINGS
+────────────────────────────────────────────────────────────────────────────────
+
+  Purpose    : ESG ratings and climate scores calculated on a specific date.
+  Grain      : COMPANY × CALCULATION_DATE × RATING_TYPE × SOURCE
+  Time key   : CALC_DT  DATE  — the date the rating was calculated or published
+
+  src_bgn_tran_dt for ratings always equals CALC_DT.
+  src_end_tran_dt = next CALC_DT for same entity and rating type minus 1 day.
+  Set by engine using LEAD() on ordered rating deliveries per entity per type.
+  9999-12-31 for the most recent rating.
+
+  Natural key columns:
+    ENTITY_KY          VARCHAR2(20)
+    CALC_DT            DATE           Calculation or publication date
+    RTNG_TYP_CD        VARCHAR2(50)   e.g. MSCI_ESG|MSCI_CLMT|SNP_ESG|ISS_ESG
+    SRC_SYS_SHRT_NM    VARCHAR2(50)
+
+  Bi-temporal columns: (as Section 4)
+    Note: SRC_BGN_TRAN_DT = CALC_DT always (enforced by CHECK constraint)
+
+  Metric columns:
+    RTNG_SCR_NO          NUMBER    Numeric score — normalised to 0-100 by engine
+    RTNG_LTR_CD          VARCHAR2  Letter grade: AAA|AA|A|BBB|BB|B|CCC
+    RTNG_CTGRY_CD        VARCHAR2  Category: LEADER|AVERAGE|LAGGARD (MSCI)
+    RTNG_CHNG_CD         VARCHAR2  UPGRADE|DOWNGRADE|UNCHANGED|INITIAL
+    RTNG_OUTL_CD         VARCHAR2  POSITIVE|STABLE|NEGATIVE|WATCH
+
+  Primary key: (ENTITY_KY, CALC_DT, RTNG_TYP_CD, SRC_SYS_SHRT_NM,
+                BGN_TRAN_DT)
+  Check constraint: SRC_BGN_TRAN_DT = CALC_DT
+
+  Mandatory indexes:
+    (ENTITY_KY, RTNG_TYP_CD, CUR_FL, SRC_END_TRAN_DT)  COMPRESS 2
+    (ENTITY_KY, RTNG_TYP_CD, SRC_BGN_TRAN_DT, SRC_END_TRAN_DT)
+
+
+────────────────────────────────────────────────────────────────────────────────
+TABLE 3B: udm_clmt_commit_fct — COMMITMENTS
+────────────────────────────────────────────────────────────────────────────────
+
+  Purpose    : Net-zero pledges, SBT commitments, Paris-alignment status,
+               RE100, EP100, and other forward-looking commitments.
+  Grain      : COMPANY × COMMITMENT_TYPE × SOURCE
+  Time key   : COMMIT_EFFT_DT  DATE  — when the commitment became effective
+
+  This is NOT a coverage period and NOT a rating date.
+  It is the date the entity made or published the commitment.
+  src_bgn_tran_dt always equals COMMIT_EFFT_DT.
+  src_end_tran_dt = date the commitment was revised or withdrawn.
+  9999-12-31 while the commitment remains active.
+
+  Version events (infrequent):
+    Commitment target year revised (e.g. 2050 → 2040)
+    Commitment withdrawn
+    Commitment scope expanded
+    Commitment verification status upgraded
+
+  ROW_CHK_SUM_TX is the primary control for version proliferation.
+  On each vendor re-delivery, if hash unchanged, no new version is written.
+  This is the common case — vendors frequently re-send unchanged commitments.
+
+  Natural key columns:
+    ENTITY_KY          VARCHAR2(20)
+    COMMIT_TYP_CD      VARCHAR2(50)   NET_ZERO|SBT|PARIS_ALIGNED|RE100|EP100
+    SRC_SYS_SHRT_NM    VARCHAR2(50)
+
+  Bi-temporal columns: (as Section 4)
+    Note: SRC_BGN_TRAN_DT = COMMIT_EFFT_DT always (CHECK constraint)
+
+  Additional column:
+    COMMIT_EFFT_DT     DATE   NOT NULL
+      Same value as SRC_BGN_TRAN_DT. Stored separately for consumer
+      readability — makes queries self-documenting without needing to know
+      that SRC_BGN_TRAN_DT carries the effective date for this table.
+
+  Metric columns:
+    COMMIT_STAT_CD        VARCHAR2  ACTIVE|WITHDRAWN|REVISED|PENDING_VALIDATION
+    COMMIT_TRGT_YR_NO     NUMBER    Year by which commitment is achieved. e.g. 2050
+    COMMIT_BASE_YR_NO     NUMBER    Base year. e.g. 2019
+    COMMIT_SCOPE_CD       VARCHAR2  SC1|SC1_2|SC1_2_3
+    COMMIT_CVG_PCT_NO     NUMBER    Coverage percentage of entity emissions
+    COMMIT_INTNSTY_NO     NUMBER    Target intensity if intensity-based commitment
+    COMMIT_INTNSTY_DENOM_CD VARCHAR2 USD_REV|FTE|TONNE_PROD
+    COMMIT_VRFY_CD        VARCHAR2  VERIFIED|SUBMITTED|NOT_SUBMITTED (e.g. SBTi)
+    COMMIT_ALG_CD         VARCHAR2  PARIS_1_5|PARIS_2|NDC_ALIGNED|UNSPECIFIED
+
+  Primary key: (ENTITY_KY, COMMIT_TYP_CD, SRC_SYS_SHRT_NM,
+                SRC_BGN_TRAN_DT, BGN_TRAN_DT)
+  Check constraint: COMMIT_EFFT_DT = SRC_BGN_TRAN_DT
+
+  Mandatory indexes:
+    (ENTITY_KY, COMMIT_TYP_CD, CUR_FL, SRC_END_TRAN_DT)  COMPRESS 2
+    (ENTITY_KY, COMMIT_TYP_CD, SRC_BGN_TRAN_DT, SRC_END_TRAN_DT)
+
+
+================================================================================
+SECTION 6 — TIME DIMENSION STRATEGY PER TABLE
+================================================================================
+
+  TABLE                    TIME KEY         DATA TYPE  FK TO REF?
+  ─────────────────────────────────────────────────────────────────────────────
+  udm_ghg_emiss_fct        DSCLSR_YR_NO     NUMBER(4)  No — raw year number
+  udm_clmt_tran_fct        DSCLSR_YR_NO     NUMBER(4)  No — raw year number
+  udm_clmt_rtng_fct        CALC_DT          DATE       No — raw date
+  udm_clmt_commit_fct      COMMIT_EFFT_DT   DATE       No — raw date
+
+  All four:
+    SRC_BGN_TRAN_DT  DATE  Source effective start — NEVER changes after INSERT
+    SRC_END_TRAN_DT  DATE  Source effective end   — NEVER changes after INSERT
+    BGN_TRAN_DT      DATE  UDM version start      — NEVER changes after INSERT
+    END_TRAN_DT      DATE  UDM version end        — updated on re-delivery
+    CUR_FL           N(1)  1=current 0=superseded — updated with END_TRAN_DT
+
+
+================================================================================
+SECTION 7 — THE UNIVERSAL POINT-IN-TIME QUERY PATTERN
+================================================================================
+
+All four tables use the same BETWEEN pattern for point-in-time queries.
+The input date changes. The pattern does not.
+
+  Query: "What was the value as of date :D?"
+
+    WHERE DATE ':D' BETWEEN src_bgn_tran_dt AND src_end_tran_dt
+    AND   cur_fl = 1
+
+  Examples:
+
+    Emissions as known on 01-Nov-2022 (before 2024 restatement):
+      WHERE DATE '2022-11-01' BETWEEN src_bgn_tran_dt AND src_end_tran_dt
+      AND   cur_fl = 1
+      AND   dsclsr_yr_no = 2022
+      → Returns the pre-restatement value
+
+    Emissions as known on 01-Jun-2024 (after 2024 restatement):
+      WHERE DATE '2024-06-01' BETWEEN src_bgn_tran_dt AND src_end_tran_dt
+      AND   cur_fl = 1
+      AND   dsclsr_yr_no = 2022
+      → Returns the restated value
+
+    Rating as of 15 March 2024:
+      WHERE DATE '2024-03-15' BETWEEN src_bgn_tran_dt AND src_end_tran_dt
+      AND   cur_fl = 1
+      AND   rtng_typ_cd = 'MSCI_ESG'
+      → Returns the rating that was current on that date
+
+    Commitment active at end of disclosure year 2024:
+      WHERE DATE '2024-12-31' BETWEEN src_bgn_tran_dt AND src_end_tran_dt
+      AND   cur_fl = 1
+      AND   commit_typ_cd = 'NET_ZERO'
+      → Returns exactly ONE commitment version per entity
+        regardless of how many historical revisions exist
+        No multiple-rows problem because BETWEEN on SCD2 dates
+        is inherently point-in-time
+
+  Current data (most common consumer query):
+    WHERE cur_fl = 1
+    AND   src_end_tran_dt = DATE '9999-12-31'
+
+  Full history for an entity:
+    WHERE entity_ky = 'ENT-1000001'
+    ORDER BY src_bgn_tran_dt ASC, bgn_tran_dt ASC
+
+
+================================================================================
+SECTION 8 — CROSS-TABLE JOIN PATTERN
+================================================================================
+
+Joining commitment data to a period-based table.
+"Which entities had active net-zero commitments during disclosure year 2024
+alongside their Scope 1 emissions?"
+
+  SELECT
+      emiss.entity_ky,
+      emiss.dsclsr_yr_no,
+      emiss.ghg_sc1_mtco2_no,
+      comm.commit_typ_cd,
+      comm.commit_trgt_yr_no,
+      comm.commit_stat_cd
+  FROM   udm_ghg_emiss_fct      emiss
+  LEFT JOIN udm_clmt_commit_fct comm
+      ON  comm.entity_ky      = emiss.entity_ky
+      AND comm.commit_typ_cd  = 'NET_ZERO'
+      -- Use the period end date as the "as-of" date for the commitment.
+      -- Returns the ONE commitment version active at year end.
+      -- BETWEEN resolves the multiple-rows problem by design.
+      AND DATE '2024-12-31'
+              BETWEEN comm.src_bgn_tran_dt AND comm.src_end_tran_dt
+      AND comm.cur_fl          = 1
+  WHERE  emiss.dsclsr_yr_no    = 2024
+  AND    emiss.src_end_tran_dt = DATE '9999-12-31'
+  AND    emiss.cur_fl          = 1;
+
+  LEFT JOIN: an entity may have emissions but no net-zero commitment.
+  INNER JOIN would silently exclude uncommitted entities.
+
+  The BETWEEN on comm.src_bgn_tran_dt / comm.src_end_tran_dt guarantees
+  exactly one commitment row per entity per commitment type.
+  The index on (entity_ky, commit_typ_cd, src_bgn_tran_dt, src_end_tran_dt)
+  makes this an index range scan — not a full table scan.
+
+Joining ratings to emissions for the same year-end:
+
+  SELECT
+      emiss.entity_ky,
+      emiss.dsclsr_yr_no,
+      emiss.ghg_sc1_mtco2_no,
+      rtng.rtng_scr_no,
+      rtng.rtng_ltr_cd,
+      rtng.calc_dt
+  FROM   udm_ghg_emiss_fct   emiss
+  LEFT JOIN udm_clmt_rtng_fct rtng
+      ON  rtng.entity_ky      = emiss.entity_ky
+      AND rtng.rtng_typ_cd    = 'MSCI_ESG'
+      -- Most recent rating within the disclosure year:
+      AND DATE '2024-12-31'
+              BETWEEN rtng.src_bgn_tran_dt AND rtng.src_end_tran_dt
+      AND rtng.cur_fl          = 1
+  WHERE  emiss.dsclsr_yr_no    = 2024
+  AND    emiss.src_end_tran_dt = DATE '9999-12-31'
+  AND    emiss.cur_fl          = 1;
+
+
+================================================================================
+SECTION 9 — RE-DELIVERY ETL LOGIC PER TABLE
+================================================================================
+
+For all four tables the re-delivery pattern is identical:
+
+  STEP 1 — Compute ROW_CHK_SUM_TX from incoming metric columns.
+
+  STEP 2 — Compare against stored ROW_CHK_SUM_TX for current row
+           (cur_fl=1, src_end_tran_dt=9999-12-31) for this natural key.
+
+  STEP 3 — If hash MATCHES: nothing has changed. No new version. EXIT.
+
+  STEP 4 — If hash DIFFERS (or no current row exists):
+    a. UPDATE existing current row:
+         END_TRAN_DT      = SYSDATE - (1/86400)
+         CUR_FL           = 0
+         SRC_END_TRAN_DT  = new effective date - 1 day (if source date known)
+                          = SYSDATE - 1 day (if no source date provided)
+    b. INSERT new current row:
+         SRC_BGN_TRAN_DT  = new effective date from source
+         SRC_END_TRAN_DT  = DATE '9999-12-31'
+         BGN_TRAN_DT      = SYSDATE
+         END_TRAN_DT      = DATE '9999-12-31'
+         CUR_FL           = 1
+         DATA_VERSION     = prior DATA_VERSION + 1
+         LOAD_DT          = SYSDATE
+         MIGRATION_FL     = N
+
+  TABLE-SPECIFIC NOTES:
+
+  udm_ghg_emiss_fct, udm_clmt_tran_fct:
+    New version driven by: vendor delivering changed values for a year
+    already in the system. Common — vendors restate annually.
+
+  udm_clmt_rtng_fct:
+    New version driven by: vendor delivering a new rating calculation date.
+    Each new CALC_DT for the same entity and rating type is a new row.
+    The LEAD() function sets SRC_END_TRAN_DT on the prior row at load time.
+    No UPDATE to prior row SRC_END_TRAN_DT needed on next delivery —
+    the LEAD() at load time handles it.
+
+  udm_clmt_commit_fct:
+    New version driven by: commitment revised, withdrawn, or target changed.
+    Events are infrequent. ROW_CHK_SUM_TX comparison means most re-deliveries
+    produce no new version (hash unchanged = do nothing).
+
+
+================================================================================
+SECTION 10 — GRAIN COMPATIBILITY NOTES
+================================================================================
+
+Different tables have different time dimensions. A consumer joining across
+tables must be aware of the following:
+
+  udm_ghg_emiss_fct    DSCLSR_YR_NO  ← annual grain
+  udm_clmt_tran_fct    DSCLSR_YR_NO  ← annual grain (compatible with above)
+  udm_clmt_rtng_fct    CALC_DT       ← point-in-time (incompatible directly)
+  udm_clmt_commit_fct  COMMIT_EFFT_DT ← event-driven (incompatible directly)
+
+  To join rating or commitment data to annual emissions:
+    Use the BETWEEN pattern with the year-end date as the as-of date.
+    DATE '2024-12-31' BETWEEN src_bgn_tran_dt AND src_end_tran_dt
+    This converts point-in-time and event-driven data to a year-end snapshot
+    for comparison with annual emissions data.
+
+  This conversion is intentional and governed. The consumer is explicitly
+  choosing to represent a point-in-time or event-driven value as a year-end
+  snapshot for the purposes of the join. This should be documented in any
+  report or model that uses this join pattern.
+
+
+================================================================================
+SECTION 11 — GLOSSARY OF TIME TERMS USED IN THIS DOCUMENT
+================================================================================
+
+  DSCLSR_YR_NO     Disclosure year number. The year the underlying activity
+                   occurred and was disclosed. Raw NUMBER(4). e.g. 2022.
+                   Maps to vendor columns: FiscalYear, ReportingYear,
+                   DisclosureYear, CoverageYear.
+
+  CALC_DT          Calculation date. The date a rating was calculated or
+                   published by the vendor. Raw DATE.
+                   Maps to: RatingDate, CalculationDate, PublicationDate.
+
+  COMMIT_EFFT_DT   Commitment effective date. The date a commitment became
+                   effective — when the entity made or published it. Raw DATE.
+                   Maps to: CommitmentDate, PledgeDate, AnnouncementDate.
+
+  SRC_BGN_TRAN_DT  Source transaction begin date. When this value was
+                   effective in the source. Set at INSERT. Never changes.
+
+  SRC_END_TRAN_DT  Source transaction end date. When superseded in source.
+                   9999-12-31 means still current. Set at INSERT. Never changes.
+
+  BGN_TRAN_DT      UDM transaction begin date. When UDM first held this
+                   version. SYSDATE at INSERT. Never changes.
+
+  END_TRAN_DT      UDM transaction end date. Updated when re-delivery
+                   supersedes this row. 9999-12-31 while active.
+
+  CUR_FL           Current flag. 1 = active UDM version. 0 = superseded.
+
+  ROW_CHK_SUM_TX   SHA256 hash of metric columns. Change detection mechanism.
+                   Prevents new version creation when data is unchanged.
+
+  MIGRATION_FL     Y = loaded from historical source during migration.
+                   N = loaded via live vendor delivery.
+
+  DATA_VERSION     Increments on each re-delivery that produces a new version.
+                   1 = first load for this natural key.
+
+
+================================================================================
+END OF DOCUMENT
+================================================================================
