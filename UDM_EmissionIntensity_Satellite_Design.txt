@@ -1,0 +1,639 @@
+UDM Platform  |  Emission Intensity Satellite Pattern	June 2026
+
+UDM Platform
+
+**Emission Intensity — Satellite Pattern Design**
+
+DDL  ·  Sample Catalog Data  ·  Harmonisation SQL
+
+Version 1.0  |  June 2026  |  Architecture Record
+
+# **1. Overview — Why the Satellite Pattern**
+
+Emission intensity disclosed by ESGbook and CDP arrives as an array of structured objects. Each element in the array carries: intensity value, unit, alternate units, basis (revenue / production / headcount), emission scopes (multi-valued), and scope 3 categories (multi-valued). Standard named-scalar vendors (e.g. scope_1_production_intensity) express the same business concept but as a single value with scope coverage implicit in the metric name.
+
+Neither pure EAV nor the standard wide-columnar stack table can accommodate this shape without loss of queryability or data integrity. The Structured Satellite pattern resolves this:
+
+| **Source Pattern** | **Example** | **Scopes Evidence** | **Engine Path** |
+| --- | --- | --- | --- |
+| Array of tuples | ESGbook, CDP | DECLARED — vendor explicit | satellite_array |
+| Named scalar metric | scope_1_production_intensity | NAME_CONVENTION — from metric name | satellite_scalar |
+
+*The scope_derivation flag on every observation row records whether scope coverage was self-reported or inferred. Downstream consumers use this to assess comparability.*
+
+# **2. Catalog Schema Changes — Minimal Surgery**
+
+Two columns are added to existing Tier 1 tables. No existing columns are modified. No existing engine paths are affected.
+
+## **2.1  udm_data_item — new column storage_pattern_cd**
+
+| ALTER TABLE udm_data_item ADD ( |
+| --- |
+| storage_pattern_cd  VARCHAR2(20) DEFAULT 'COLUMNAR' NOT NULL |
+| -- COLUMNAR         existing behaviour — wide stack column |
+| -- EAV              existing behaviour — federated EAV ingestion |
+| -- STRUCT_SATELLITE new — HDR / OBS / shared junction tables |
+| CONSTRAINT chk_di_storage_ptn CHECK ( |
+| storage_pattern_cd IN ('COLUMNAR','EAV','STRUCT_SATELLITE') |
+| ) |
+| ); |
+
+## **2.2  udm_data_item_src_map — two new columns**
+
+| ALTER TABLE udm_data_item_src_map ADD ( |
+| --- |
+| sat_basis_cd       VARCHAR2(32)  NULL, |
+| -- Populated only for STRUCT_SATELLITE + NAME_CONVENTION sources. |
+| -- Encodes the denominator parsed from the metric name at mapping time. |
+| -- Values: PRODUCTION │ REVENUE │ HEADCOUNT │ FLOOR_AREA |
+| -- NULL for DECLARED sources (basis is read from source row at runtime). |
+|  |
+| sat_scope_list_tx  VARCHAR2(64)  NULL |
+| -- Pipe-delimited scope codes parsed from the metric name at mapping time. |
+| -- Examples: '1'  │  '1│2'  │  '1│2│3' |
+| -- NULL for DECLARED sources (scopes are read from source row at runtime). |
+| -- The engine splits this at runtime — no name parsing in the engine. |
+| ); |
+
+# **3. Satellite Table DDL**
+
+Five tables form the satellite. Two (udm_obs_scope, udm_obs_s3cat) are shared across all future STRUCT_SATELLITE domains (reduction targets, net-zero commitments, etc). Only two new tables are required per additional concept once the shared junctions exist.
+
+## **3.1  udm_ei_hdr — Disclosure Header**
+
+*One row per entity × source × assessed_dt. Owns is_golden — the golden-copy decision is made at disclosure level, not at individual observation level. SCD2 bi-temporal columns match stack table convention.*
+
+| CREATE TABLE udm_ei_hdr ( |
+| --- |
+| -- Identity |
+| intensity_hk        VARCHAR2(64)   NOT NULL, |
+| -- SHA256(entity_key │ '│' │ source_id │ '│' │ assessed_dt YYYYMMDD) |
+| -- Globally unique per disclosure unit. |
+|  |
+| entity_key          VARCHAR2(20)   NOT NULL,   -- → udm_entity_registry |
+| source_id           VARCHAR2(20)   NOT NULL,   -- → udm_source_registry |
+| assessed_dt         DATE           NOT NULL,   -- MSCI / vendor snapshot date |
+|  |
+| -- Delivery metadata |
+| obs_count           NUMBER(3)      NOT NULL,   -- expected observation count |
+| delivered_dt        TIMESTAMP      NOT NULL,   -- when vendor file arrived |
+| is_golden           CHAR(1)        DEFAULT 'N' NOT NULL, |
+|  |
+| -- SCD2 bi-temporal (same convention as domain stack tables) |
+| row_effective_dt    DATE           NOT NULL,   -- SYSDATE at INSERT |
+| row_expiry_dt       DATE           DEFAULT DATE '9999-12-31' NOT NULL, |
+| cur_fl              NUMBER(1)      DEFAULT 1   NOT NULL, |
+|  |
+| -- Lineage |
+| lineage_id          VARCHAR2(30)   NOT NULL,   -- → udm_lineage (LOAD step) |
+|  |
+| CONSTRAINT pk_udm_ei_hdr       PRIMARY KEY (intensity_hk), |
+| CONSTRAINT chk_ei_hdr_golden   CHECK (is_golden  IN ('Y','N')), |
+| CONSTRAINT chk_ei_hdr_cur      CHECK (cur_fl     IN (0,1)) |
+| ); |
+|  |
+| CREATE INDEX idx_ei_hdr_entity ON udm_ei_hdr |
+| (entity_key, assessed_dt, is_golden, cur_fl) COMPRESS 2; |
+| CREATE INDEX idx_ei_hdr_src    ON udm_ei_hdr |
+| (source_id, assessed_dt, cur_fl); |
+
+## **3.2  udm_ei_obs — Observation Detail**
+
+*One row per array element (ESGbook/CDP) or one row with obs_seq = 1 (named scalar vendors). Carries all observation-level scalar attributes. Multi-valued dimensions (scopes, scope 3 categories) live in the shared junction tables.*
+
+| CREATE TABLE udm_ei_obs ( |
+| --- |
+| obs_hk              VARCHAR2(64)   NOT NULL, |
+| -- SHA256('EI│' │ entity_key │ '│' │ source_id │ '│' │ assessed_dt │ '│' │ obs_seq) |
+| -- 'EI' domain prefix ensures global uniqueness across shared junctions. |
+|  |
+| intensity_hk        VARCHAR2(64)   NOT NULL,   -- → udm_ei_hdr |
+| obs_seq             NUMBER(3)      NOT NULL,   -- array position; always 1 for scalars |
+|  |
+| intensity_value     NUMBER(24,8), |
+| unit                VARCHAR2(64),              -- tCO2e/MUSD, kgCO2e/unit, etc. |
+| other_units         VARCHAR2(512),             -- pipe-delimited alternate units |
+| basis               VARCHAR2(32),              -- REVENUE │ PRODUCTION │ HEADCOUNT │ FLOOR_AREA |
+| scope_derivation    VARCHAR2(20)   NOT NULL,   -- DECLARED │ NAME_CONVENTION |
+|  |
+| CONSTRAINT pk_udm_ei_obs          PRIMARY KEY (obs_hk), |
+| CONSTRAINT fk_ei_obs_hdr          FOREIGN KEY (intensity_hk) |
+| REFERENCES udm_ei_hdr (intensity_hk), |
+| CONSTRAINT chk_ei_obs_derivation  CHECK ( |
+| scope_derivation IN ('DECLARED','NAME_CONVENTION') |
+| ) |
+| ); |
+|  |
+| CREATE INDEX idx_ei_obs_hdr ON udm_ei_obs (intensity_hk, obs_seq); |
+
+## **3.3  udm_obs_scope — Shared Scope Junction**
+
+*Shared across ALL satellite domains. obs_hk carries domain prefix (EI|, RT| etc.) — no domain discriminator column needed. This table will also serve reduction targets, net-zero commitments, and any future STRUCT_SATELLITE concept with scope coverage.*
+
+| CREATE TABLE udm_obs_scope ( |
+| --- |
+| obs_hk              VARCHAR2(64)   NOT NULL, |
+| scope_code          VARCHAR2(10)   NOT NULL,   -- '1' │ '2' │ '3' │ '1+2' etc. |
+|  |
+| CONSTRAINT pk_udm_obs_scope PRIMARY KEY (obs_hk, scope_code) |
+| ); |
+|  |
+| CREATE INDEX idx_obs_scope_hk ON udm_obs_scope (obs_hk); |
+
+## **3.4  udm_obs_s3cat — Shared Scope 3 Category Junction**
+
+| CREATE TABLE udm_obs_s3cat ( |
+| --- |
+| obs_hk              VARCHAR2(64)   NOT NULL, |
+| category_code       VARCHAR2(10)   NOT NULL,   -- '1'..'15' per GHG Protocol |
+|  |
+| CONSTRAINT pk_udm_obs_s3cat PRIMARY KEY (obs_hk, category_code) |
+| ); |
+|  |
+| CREATE INDEX idx_obs_s3cat_hk ON udm_obs_s3cat (obs_hk); |
+
+## **3.5  Table Count — Pattern Economics**
+
+| **Concept** | **HDR table** | **OBS table** | **Shared junctions** | **Total net-new** |
+| --- | --- | --- | --- | --- |
+| Emission Intensity | udm_ei_hdr | udm_ei_obs | udm_obs_scope + udm_obs_s3cat (first use — created here) | 4 |
+| Reduction Target (future) | udm_rt_hdr | udm_rt_obs | REUSE — no new junction tables | 2 |
+| Net Zero Commitment (future) | udm_nz_hdr | udm_nz_obs | REUSE | 2 |
+
+# **4. Sample Catalog Data**
+
+The following INSERT statements seed the catalog for two representative data items: the ESGbook/CDP array disclosure and the Scope 1 Production Intensity named scalar.
+
+## **4.1  udm_data_item — 2 rows**
+
+| -- ── Row 1: ESGbook / CDP array disclosure ────────────────────────────── |
+| --- |
+| INSERT INTO udm_data_item ( |
+| data_itm_scd_1_ky, data_itm_scd_2_ky, |
+| data_itm_id, |
+| data_itm_nm, |
+| data_itm_de_tx, |
+| phy_trgt_tbl_nm,       -- satellite anchor; not a stack column |
+| storage_pattern_cd,    -- NEW column |
+| data_itm_trgt_unit_tx, -- NULL: unit varies per observation |
+| mtrc_grp_tx, |
+| data_typ_cd, |
+| is_mndty_fl, |
+| cur_fl |
+| ) VALUES ( |
+| 4001, 4001001, |
+| 'CLM_GHG_EMISS_INTENSITY_RPT', |
+| 'Reported Emission Intensity (Vendor Array)', |
+| 'Array of emission intensity observations as disclosed by vendor. ' |
+| ││ 'Each observation carries value, unit, basis, covered scopes, ' |
+| ││ 'and scope 3 categories. Scope coverage is vendor-declared.', |
+| 'udm_ei_hdr', |
+| 'STRUCT_SATELLITE', |
+| NULL,              -- no single canonical unit; stored per-obs on udm_ei_obs |
+| 'GHG_INTENSITY', |
+| 'STRUCTURED', |
+| 'N',               -- not mandatory: array may be absent |
+| 1 |
+| ); |
+|  |
+| -- ── Row 2: Scope 1 Production Intensity (named scalar) ────────────────── |
+| INSERT INTO udm_data_item ( |
+| data_itm_scd_1_ky, data_itm_scd_2_ky, |
+| data_itm_id, |
+| data_itm_nm, |
+| data_itm_de_tx, |
+| phy_trgt_tbl_nm, |
+| storage_pattern_cd, |
+| data_itm_trgt_unit_tx, |
+| mtrc_grp_tx, |
+| data_typ_cd, |
+| is_mndty_fl, |
+| cur_fl |
+| ) VALUES ( |
+| 4002, 4002001, |
+| 'CLM_GHG_EI_S1_PROD', |
+| 'Scope 1 Production Intensity', |
+| 'Emission intensity normalised by production units, covering Scope 1 only. ' |
+| ││ 'Scope coverage inferred from metric name — not vendor-declared. ' |
+| ││ 'No Scope 3 category breakdown available for this metric.', |
+| 'udm_ei_hdr',      -- same satellite family, same anchor table |
+| 'STRUCT_SATELLITE', |
+| 'tCO2e_per_unit',  -- canonical unit known for this metric |
+| 'GHG_INTENSITY', |
+| 'NUMBER', |
+| 'N', |
+| 1 |
+| ); |
+
+## **4.2  udm_data_item_src_map — 4 rows**
+
+| -- ── Map 1: ESGbook → array intensity (DECLARED) ──────────────────────── |
+| --- |
+| -- sat_basis_cd and sat_scope_list_tx are NULL for DECLARED sources: |
+| -- the engine reads basis and scopes from the source row at runtime. |
+| INSERT INTO udm_data_item_src_map ( |
+| map_id, data_itm_scd_1_ky, source_id, |
+| attr_src_nm, |
+| attr_xfrm_ru_tx, |
+| is_derived_fl, |
+| attr_unit_from_tx, |
+| sat_basis_cd, |
+| sat_scope_list_tx |
+| ) VALUES ( |
+| 'MAP-4001-ESG-001', 4001, 'SRC_ESGBOOK', |
+| 'reported_emission_intensities',  -- array field in ESGbook staging |
+| 'satellite_array', |
+| 'N', |
+| NULL,   -- unit comes from source row (obs-level) |
+| NULL,   -- basis comes from source row |
+| NULL    -- scopes come from source row |
+| ); |
+|  |
+| -- ── Map 2: CDP → array intensity (same pattern, different source) ─────── |
+| INSERT INTO udm_data_item_src_map ( |
+| map_id, data_itm_scd_1_ky, source_id, |
+| attr_src_nm, |
+| attr_xfrm_ru_tx, |
+| is_derived_fl, |
+| attr_unit_from_tx, |
+| sat_basis_cd, |
+| sat_scope_list_tx |
+| ) VALUES ( |
+| 'MAP-4001-CDP-001', 4001, 'SRC_CDP', |
+| 'emission_intensities',   -- CDP's equivalent array field |
+| 'satellite_array', |
+| 'N', |
+| NULL, NULL, NULL |
+| ); |
+|  |
+| -- ── Map 3: Vendor X → Scope 1 Production Intensity (NAME_CONVENTION) ──── |
+| -- sat_basis_cd and sat_scope_list_tx are populated once at mapping time. |
+| -- The engine binds these as parameters — no metric-name parsing at runtime. |
+| INSERT INTO udm_data_item_src_map ( |
+| map_id, data_itm_scd_1_ky, source_id, |
+| attr_src_nm, |
+| attr_xfrm_ru_tx, |
+| is_derived_fl, |
+| attr_unit_from_tx, |
+| sat_basis_cd, |
+| sat_scope_list_tx |
+| ) VALUES ( |
+| 'MAP-4002-VNDX-001', 4002, 'SRC_VNDX', |
+| 'scope_1_production_intensity', |
+| 'satellite_scalar', |
+| 'N', |
+| 'col:INTENSITY_UNIT',  -- read unit from sibling source column |
+| 'PRODUCTION',          -- resolved from metric name at mapping time |
+| '1'                    -- scope 1 only; no S3CAT rows will be written |
+| ); |
+|  |
+| -- ── Map 4: Vendor Y → Scope 1+2 Production Intensity ─────────────────── |
+| INSERT INTO udm_data_item_src_map ( |
+| map_id, data_itm_scd_1_ky, source_id, |
+| attr_src_nm, |
+| attr_xfrm_ru_tx, |
+| is_derived_fl, |
+| attr_unit_from_tx, |
+| sat_basis_cd, |
+| sat_scope_list_tx |
+| ) VALUES ( |
+| 'MAP-4002-VNDY-001', 4002, 'SRC_VNDY', |
+| 'scope_1_2_production_intensity', |
+| 'satellite_scalar', |
+| 'N', |
+| 'tCO2e_per_unit',      -- static unit for this vendor |
+| 'PRODUCTION', |
+| '1│2'                  -- two rows written to udm_obs_scope at runtime |
+| ); |
+
+## **4.3  udm_transform_rules — 2 new patterns**
+
+| -- Two new entries in the transform rule library: |
+| --- |
+| INSERT INTO udm_transform_rules (rule_id, rule_name, rule_desc_tx, rule_sql_tx) VALUES ( |
+| 'TXF-SAT-ARR-001', |
+| 'satellite_array', |
+| 'Source delivers array of intensity tuples. Engine routes to step_write_satellite(). ' |
+| ││ 'Scope derivation = DECLARED. Writes HDR + OBS + scope junction + s3cat junction.', |
+| 'ENGINE_HANDLED'   -- engine procedure, not an inline SQL expression |
+| ); |
+|  |
+| INSERT INTO udm_transform_rules (rule_id, rule_name, rule_desc_tx, rule_sql_tx) VALUES ( |
+| 'TXF-SAT-SCL-001', |
+| 'satellite_scalar', |
+| 'Source delivers single named metric. obs_seq always 1. Basis from sat_basis_cd. ' |
+| ││ 'Scopes from sat_scope_list_tx. Scope derivation = NAME_CONVENTION. ' |
+| ││ 'S3CAT rows written only if scope 3 is present in sat_scope_list_tx.', |
+| 'ENGINE_HANDLED' |
+| ); |
+
+# **5. Harmonisation SQL**
+
+The harmonisation engine reads storage_pattern_cd from udm_data_item and routes to step_write_satellite() when the value is STRUCT_SATELLITE. Within that procedure, attr_xfrm_ru_tx determines which of the two paths executes. The standard stack INSERT is never called for satellite data items.
+
+| **storage_pattern_cd** | **attr_xfrm_ru_tx** | **Engine Path** | **Tables Written** |
+| --- | --- | --- | --- |
+| COLUMNAR | (any) | step_write_stack() | udm_{domain}_stk |
+| EAV | (any) | step_write_stack() after EAV pivot | udm_{domain}_stk |
+| STRUCT_SATELLITE | satellite_array | step_write_satellite(DECLARED) | HDR + OBS + SCOPE + S3CAT |
+| STRUCT_SATELLITE | satellite_scalar | step_write_satellite(NAME_CONV) | HDR + OBS + SCOPE (no S3CAT unless scope 3 present) |
+
+## **5.1  Path A — ESGbook / CDP Array Source (satellite_array)**
+
+Staging table assumed: stg_esgbook_intensity — one row per entity x snapshot x obs_seq, already exploded from the vendor API response. Columns: esgbook_id, assessed_dt, obs_seq, intensity_value, unit, other_units, basis, scopes (CSV), scope3_cats (CSV).
+
+**Step A1 — Header (MERGE — idempotent on re-delivery)**
+
+| -- ── A1: HEADER ────────────────────────────────────────────────────────── |
+| --- |
+| -- One row per entity x source x assessed_dt. |
+| -- MERGE not INSERT: re-delivery must update obs_count without creating duplicates. |
+|  |
+| MERGE INTO udm_ei_hdr tgt |
+| USING ( |
+| SELECT |
+| STANDARD_HASH( |
+| xref.entity_key ││ '│SRC_ESGBOOK│' |
+| ││ TO_CHAR(stg.assessed_dt,'YYYYMMDD'), 'SHA256' |
+| )                                               AS intensity_hk, |
+| xref.entity_key, |
+| 'SRC_ESGBOOK'                                   AS source_id, |
+| stg.assessed_dt, |
+| COUNT(stg.obs_seq) OVER ( |
+| PARTITION BY stg.esgbook_id, stg.assessed_dt |
+| )                                               AS obs_count, |
+| :p_delivered_dt                                 AS delivered_dt, |
+| :p_lineage_id                                   AS lineage_id |
+| FROM stg_esgbook_intensity stg |
+| JOIN udm_company_xref xref |
+| ON  xref.vendor_id    = 'SRC_ESGBOOK' |
+| AND xref.external_id  = stg.esgbook_id |
+| AND xref.match_status IN ('CONFIRMED','ENGINE') |
+| AND xref.effective_to IS NULL |
+| ) src |
+| ON (tgt.intensity_hk  = src.intensity_hk |
+| AND tgt.row_expiry_dt = DATE '9999-12-31') |
+| WHEN MATCHED THEN |
+| UPDATE SET |
+| tgt.obs_count    = src.obs_count, |
+| tgt.delivered_dt = src.delivered_dt, |
+| tgt.lineage_id   = src.lineage_id |
+| WHEN NOT MATCHED THEN |
+| INSERT (intensity_hk, entity_key, source_id, assessed_dt, |
+| obs_count, delivered_dt, is_golden, |
+| row_effective_dt, row_expiry_dt, cur_fl, lineage_id) |
+| VALUES (src.intensity_hk, src.entity_key, src.source_id, src.assessed_dt, |
+| src.obs_count, src.delivered_dt, 'N', |
+| SYSDATE, DATE '9999-12-31', 1, src.lineage_id); |
+
+**Step A2 — Observations**
+
+| -- ── A2: OBSERVATIONS ──────────────────────────────────────────────────── |
+| --- |
+| -- One row per array element. |
+| -- obs_hk prefixed 'EI' to guarantee no collision with future satellite domains |
+| -- sharing udm_obs_scope and udm_obs_s3cat. |
+|  |
+| INSERT INTO udm_ei_obs ( |
+| obs_hk, intensity_hk, obs_seq, |
+| intensity_value, unit, other_units, basis, |
+| scope_derivation |
+| ) |
+| SELECT |
+| STANDARD_HASH( |
+| 'EI│' ││ xref.entity_key ││ '│SRC_ESGBOOK│' |
+| ││ TO_CHAR(stg.assessed_dt,'YYYYMMDD') ││ '│' |
+| ││ TO_CHAR(stg.obs_seq), 'SHA256' |
+| )                       AS obs_hk, |
+| STANDARD_HASH( |
+| xref.entity_key ││ '│SRC_ESGBOOK│' |
+| ││ TO_CHAR(stg.assessed_dt,'YYYYMMDD'), 'SHA256' |
+| )                       AS intensity_hk, |
+| stg.obs_seq, |
+| stg.intensity_value, |
+| stg.unit, |
+| stg.other_units, |
+| stg.basis, |
+| 'DECLARED'              AS scope_derivation |
+| FROM stg_esgbook_intensity stg |
+| JOIN udm_company_xref xref |
+| ON  xref.vendor_id    = 'SRC_ESGBOOK' |
+| AND xref.external_id  = stg.esgbook_id |
+| AND xref.match_status IN ('CONFIRMED','ENGINE') |
+| AND xref.effective_to IS NULL; |
+
+**Step A3 — Scopes junction**
+
+| -- ── A3: SCOPES ────────────────────────────────────────────────────────── |
+| --- |
+| -- stg.scopes is CSV e.g. '1,2,3'. |
+| -- apex_string.split tokenises at runtime — no PL/SQL loop required. |
+| -- DISTINCT guards against duplicate scope codes in source data. |
+|  |
+| INSERT INTO udm_obs_scope (obs_hk, scope_code) |
+| SELECT DISTINCT |
+| STANDARD_HASH( |
+| 'EI│' ││ xref.entity_key ││ '│SRC_ESGBOOK│' |
+| ││ TO_CHAR(stg.assessed_dt,'YYYYMMDD') ││ '│' |
+| ││ TO_CHAR(stg.obs_seq), 'SHA256' |
+| )                       AS obs_hk, |
+| TRIM(sc.column_value)   AS scope_code |
+| FROM stg_esgbook_intensity stg |
+| JOIN udm_company_xref xref |
+| ON  xref.vendor_id    = 'SRC_ESGBOOK' |
+| AND xref.external_id  = stg.esgbook_id |
+| AND xref.match_status IN ('CONFIRMED','ENGINE') |
+| AND xref.effective_to IS NULL |
+| CROSS JOIN TABLE(apex_string.split(stg.scopes, ',')) sc |
+| WHERE stg.scopes IS NOT NULL |
+| AND TRIM(sc.column_value) IS NOT NULL; |
+
+**Step A4 — Scope 3 categories junction**
+
+| -- ── A4: SCOPE 3 CATEGORIES ────────────────────────────────────────────── |
+| --- |
+| -- Only written when source declares s3 categories. |
+| -- Absent = no rows written. This is intentional and correct. |
+|  |
+| INSERT INTO udm_obs_s3cat (obs_hk, category_code) |
+| SELECT DISTINCT |
+| STANDARD_HASH( |
+| 'EI│' ││ xref.entity_key ││ '│SRC_ESGBOOK│' |
+| ││ TO_CHAR(stg.assessed_dt,'YYYYMMDD') ││ '│' |
+| ││ TO_CHAR(stg.obs_seq), 'SHA256' |
+| )                       AS obs_hk, |
+| TRIM(cat.column_value)  AS category_code |
+| FROM stg_esgbook_intensity stg |
+| JOIN udm_company_xref xref |
+| ON  xref.vendor_id    = 'SRC_ESGBOOK' |
+| AND xref.external_id  = stg.esgbook_id |
+| AND xref.match_status IN ('CONFIRMED','ENGINE') |
+| AND xref.effective_to IS NULL |
+| CROSS JOIN TABLE(apex_string.split(stg.scope3_cats, ',')) cat |
+| WHERE stg.scope3_cats IS NOT NULL |
+| AND TRIM(cat.column_value) IS NOT NULL |
+| AND TRIM(cat.column_value) != ''; |
+
+## **5.2  Path B — Named Scalar Source (satellite_scalar)**
+
+Staging table assumed: stg_vndx_climate — standard COLUMNAR layout with one row per entity per snapshot. Relevant columns: vndx_id, assessed_dt, scope_1_production_intensity, intensity_unit (optional sibling unit column). The engine binds sat_basis_cd and sat_scope_list_tx from the src_map row as session-level parameters before executing the SQL blocks below.
+
+**Step B1 — Header (MERGE — same pattern as Path A)**
+
+| -- ── B1: HEADER ────────────────────────────────────────────────────────── |
+| --- |
+| -- obs_count is always 1 for scalar sources. |
+|  |
+| MERGE INTO udm_ei_hdr tgt |
+| USING ( |
+| SELECT |
+| STANDARD_HASH( |
+| xref.entity_key ││ '│SRC_VNDX│' |
+| ││ TO_CHAR(stg.assessed_dt,'YYYYMMDD'), 'SHA256' |
+| )                               AS intensity_hk, |
+| xref.entity_key, |
+| 'SRC_VNDX'                      AS source_id, |
+| stg.assessed_dt, |
+| 1                               AS obs_count,  -- always 1 for scalar |
+| :p_delivered_dt                 AS delivered_dt, |
+| :p_lineage_id                   AS lineage_id |
+| FROM stg_vndx_climate stg |
+| JOIN udm_company_xref xref |
+| ON  xref.vendor_id    = 'SRC_VNDX' |
+| AND xref.external_id  = stg.vndx_id |
+| AND xref.match_status IN ('CONFIRMED','ENGINE') |
+| AND xref.effective_to IS NULL |
+| WHERE stg.scope_1_production_intensity IS NOT NULL |
+| ) src |
+| ON (tgt.intensity_hk  = src.intensity_hk |
+| AND tgt.row_expiry_dt = DATE '9999-12-31') |
+| WHEN MATCHED THEN |
+| UPDATE SET tgt.delivered_dt = src.delivered_dt, |
+| tgt.lineage_id   = src.lineage_id |
+| WHEN NOT MATCHED THEN |
+| INSERT (intensity_hk, entity_key, source_id, assessed_dt, |
+| obs_count, delivered_dt, is_golden, |
+| row_effective_dt, row_expiry_dt, cur_fl, lineage_id) |
+| VALUES (src.intensity_hk, src.entity_key, src.source_id, src.assessed_dt, |
+| 1, src.delivered_dt, 'N', |
+| SYSDATE, DATE '9999-12-31', 1, src.lineage_id); |
+
+**Step B2 — Observation (obs_seq always 1)**
+
+| -- ── B2: OBSERVATION ───────────────────────────────────────────────────── |
+| --- |
+| -- obs_seq hardcoded 1. |
+| -- :p_sat_basis_cd   = 'PRODUCTION'     (bound from udm_data_item_src_map) |
+| -- :p_scope_deriv    = 'NAME_CONVENTION' (bound from engine — scalar path) |
+| -- :p_canonical_unit = 'tCO2e_per_unit' (from data_itm_trgt_unit_tx fallback) |
+|  |
+| INSERT INTO udm_ei_obs ( |
+| obs_hk, intensity_hk, obs_seq, |
+| intensity_value, unit, other_units, basis, |
+| scope_derivation |
+| ) |
+| SELECT |
+| STANDARD_HASH( |
+| 'EI│' ││ xref.entity_key ││ '│SRC_VNDX│' |
+| ││ TO_CHAR(stg.assessed_dt,'YYYYMMDD') ││ '│1', 'SHA256' |
+| )                                   AS obs_hk, |
+| STANDARD_HASH( |
+| xref.entity_key ││ '│SRC_VNDX│' |
+| ││ TO_CHAR(stg.assessed_dt,'YYYYMMDD'), 'SHA256' |
+| )                                   AS intensity_hk, |
+| 1                                   AS obs_seq, |
+| stg.scope_1_production_intensity    AS intensity_value, |
+| NVL(stg.intensity_unit, |
+| :p_canonical_unit)              AS unit, |
+| NULL                                AS other_units, |
+| :p_sat_basis_cd                     AS basis, |
+| :p_scope_deriv                      AS scope_derivation |
+| FROM stg_vndx_climate stg |
+| JOIN udm_company_xref xref |
+| ON  xref.vendor_id    = 'SRC_VNDX' |
+| AND xref.external_id  = stg.vndx_id |
+| AND xref.match_status IN ('CONFIRMED','ENGINE') |
+| AND xref.effective_to IS NULL |
+| WHERE stg.scope_1_production_intensity IS NOT NULL; |
+
+**Step B3 — Scopes (from sat_scope_list_tx metadata, not source column)**
+
+| -- ── B3: SCOPES ────────────────────────────────────────────────────────── |
+| --- |
+| -- :p_sat_scope_list is bound from udm_data_item_src_map.sat_scope_list_tx. |
+| -- For this map row: '1' → one scope row written. |
+| -- For a '1│2' map row: two scope rows written — no code change needed. |
+|  |
+| INSERT INTO udm_obs_scope (obs_hk, scope_code) |
+| SELECT |
+| STANDARD_HASH( |
+| 'EI│' ││ xref.entity_key ││ '│SRC_VNDX│' |
+| ││ TO_CHAR(stg.assessed_dt,'YYYYMMDD') ││ '│1', 'SHA256' |
+| )                       AS obs_hk, |
+| TRIM(sc.column_value)   AS scope_code |
+| FROM stg_vndx_climate stg |
+| JOIN udm_company_xref xref |
+| ON  xref.vendor_id    = 'SRC_VNDX' |
+| AND xref.external_id  = stg.vndx_id |
+| AND xref.match_status IN ('CONFIRMED','ENGINE') |
+| AND xref.effective_to IS NULL |
+| CROSS JOIN TABLE(apex_string.split(:p_sat_scope_list, '│')) sc |
+| WHERE stg.scope_1_production_intensity IS NOT NULL; |
+|  |
+| -- ── B4: S3CAT — conditionally skipped ─────────────────────────────────── |
+| -- Engine checks: IF '3' NOT IN sat_scope_list_tx |
+| --                THEN skip this block entirely. |
+| -- For scope_1_production_intensity: sat_scope_list_tx = '1' → skipped. |
+| -- No empty rows are written to udm_obs_s3cat. |
+
+# **6. Golden Copy Materialised View**
+
+Consumers query the materialised view. The four-table join is hidden. The LISTAGG produces a comma-separated scope and category list per observation — the same shape as the original vendor disclosure.
+
+| CREATE MATERIALIZED VIEW mv_emission_intensity_golden |
+| --- |
+| REFRESH ON DEMAND |
+| AS |
+| SELECT |
+| h.entity_key, |
+| h.source_id, |
+| h.assessed_dt, |
+| o.obs_seq, |
+| o.intensity_value, |
+| o.unit, |
+| o.other_units, |
+| o.basis, |
+| o.scope_derivation, |
+| LISTAGG(DISTINCT s.scope_code,    ',') |
+| WITHIN GROUP (ORDER BY s.scope_code)    AS scopes, |
+| LISTAGG(DISTINCT c.category_code, ',') |
+| WITHIN GROUP (ORDER BY c.category_code) AS scope3_categories |
+| FROM      udm_ei_hdr   h |
+| JOIN      udm_ei_obs   o  ON o.intensity_hk = h.intensity_hk |
+| LEFT JOIN udm_obs_scope s  ON s.obs_hk = o.obs_hk |
+| LEFT JOIN udm_obs_s3cat c  ON c.obs_hk = o.obs_hk |
+| WHERE h.is_golden     = 'Y' |
+| AND h.cur_fl        = 1 |
+| AND h.row_expiry_dt = DATE '9999-12-31' |
+| GROUP BY |
+| h.entity_key, h.source_id, h.assessed_dt, |
+| o.obs_seq, o.intensity_value, o.unit, |
+| o.other_units, o.basis, o.scope_derivation; |
+|  |
+| CREATE UNIQUE INDEX idx_mv_ei_golden |
+| ON mv_emission_intensity_golden |
+| (entity_key, source_id, assessed_dt, obs_seq); |
+
+# **7. Key Design Decisions**
+
+| **Decision** | **Rationale** |
+| --- | --- |
+| MERGE not INSERT on HDR | Re-delivery of the same snapshot must update obs_count atomically. INSERT would create duplicates or require a prior DELETE. |
+| is_golden on HDR not OBS | The golden-copy decision promotes an entire vendor disclosure, not individual observations. Putting is_golden on OBS would require N updates per promotion and create an update anomaly. |
+| obs_hk prefixed with domain code (EI│) | udm_obs_scope and udm_obs_s3cat are shared. A future RT│ prefix for reduction targets guarantees no collision without a domain discriminator column on the junction tables. |
+| scope_derivation on OBS | Consumers and DQ systems need to know whether scope coverage was self-reported (DECLARED) or inferred from a metric name (NAME_CONVENTION). This is a data quality signal, not a processing flag. |
+| sat_basis_cd / sat_scope_list_tx on src_map | Metric-name parsing happens once at catalog mapping time, not at every pipeline run. The engine binds pre-resolved values from the map row — no regex or name parsing in the runtime engine. |
+| No S3CAT rows for scope 1/2 scalars | Absence of rows in udm_obs_s3cat means 'not applicable', not 'unknown'. Inserting NULL placeholder rows would make this distinction impossible. |
+| Standard COLUMNAR/EAV paths unchanged | The STRUCT_SATELLITE branch is additive. No existing stack table, arbitration step, or consumer view is modified. The engine branches on storage_pattern_cd before any stack write. |
+
+	Architecture Record — Internal Use
